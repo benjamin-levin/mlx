@@ -986,27 +986,40 @@ array fused_swiglu_gather_qmv(
         "[fused_swiglu_gather_qmv] rhs_indices must be uint32");
   }
 
-  // Output shape: gate is (..., M, K_in), w is (E, N_out, K_in/8) packed.
-  // For gather, the output shape is (...indices_shape..., M, N).
-  int M = gate.shape(-2);
+  // Output shape: gate is (..., K_in), w is (E, N_out, K_in/8) packed.
+  // Each gate[..., :] vector is matmul'd against one expert (selected by
+  // rhs_indices[...]). Output shape is gate.shape() with the last (K_in)
+  // dim replaced by N (out_vec_size from w).
   int N = w.shape(-2);
-  // Compute output shape from rhs_indices broadcasted with gate
-  auto out_shape = rhs_indices.shape();
-  out_shape.push_back(M);
-  out_shape.push_back(N);
+  auto user_out_shape = gate.shape();
+  user_out_shape.back() = N;
 
-  std::vector<array> inputs = {gate, up, w, scales};
+  // The compiled kernel uses MLX's standard gather-matmul stride layout
+  // which expects inputs of shape (..., M=1, K_in). We add the singleton
+  // M dim to gate/up here, then squeeze it back off in the user-facing
+  // output (by allocating the un-squeezed shape and reshaping at the end).
+  auto gate_5d_shape = gate.shape();
+  gate_5d_shape.insert(gate_5d_shape.end() - 1, 1);
+  auto gate_m1 = reshape(gate, gate_5d_shape, s);
+  auto up_m1 = reshape(up, gate_5d_shape, s);
+
+  // Internal output shape: (..., 1, N). Reshape to user shape at the end.
+  auto internal_out_shape = gate_5d_shape;
+  internal_out_shape.back() = N;
+
+  std::vector<array> inputs = {gate_m1, up_m1, w, scales};
   if (biases.has_value()) {
     inputs.push_back(*biases);
   }
   inputs.push_back(rhs_indices);
 
-  return array(
-      std::move(out_shape),
+  auto internal_out = array(
+      std::move(internal_out_shape),
       gate.dtype(),
       std::make_shared<FusedSwiGLUGatherQMV>(
           s, /* fallback */ nullptr, group_size, bits, mode),
       std::move(inputs));
+  return reshape(internal_out, user_out_shape, s);
 }
 
 } // namespace mlx::core::fast

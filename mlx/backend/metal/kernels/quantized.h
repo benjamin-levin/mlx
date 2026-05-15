@@ -2192,26 +2192,25 @@ template <typename T, int group_size, int bits>
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
   int M = x_shape[x_batch_ndims];
-  // Inline the gather offsets so we can apply the SAME x-offset to BOTH
-  // gate and up (which share strides). This mirrors adjust_matrix_offsets
-  // for the gather case (the second overload at line ~1582).
-  uint32_t x_idx;
+  // For our fused-SwiGLU kernel:
+  //   - gate/up rows are indexed by tid.z directly (the gather batch index)
+  //   - w/scales/biases are indexed by rhs_indices[tid.z] (the expert id)
+  //   - y is indexed by tid.z * out_vec_size * M
   uint32_t w_idx;
   if (batch_ndims == 1) {
-    x_idx = lhs_indices[tid.z * lhs_strides[0]];
     w_idx = rhs_indices[tid.z * rhs_strides[0]];
   } else {
     ulong2 bidx = elem_to_loc_broadcast(
         tid.z, batch_shape, lhs_strides, rhs_strides, batch_ndims);
-    x_idx = lhs_indices[bidx.x];
     w_idx = rhs_indices[bidx.y];
   }
-  // Offset both gate and up by the same x_idx
+  // Offset gate/up directly by tid.z using gate's batch strides.
+  // x_batch_ndims encodes the per-gather-batch dims of gate's shape.
   if (x_batch_ndims == 1) {
-    gate += x_idx * x_strides[0];
-    up   += x_idx * x_strides[0];
+    gate += tid.z * x_strides[0];
+    up   += tid.z * x_strides[0];
   } else {
-    auto x_off = elem_to_loc(x_idx, x_shape, x_strides, x_batch_ndims);
+    auto x_off = elem_to_loc(tid.z, x_shape, x_strides, x_batch_ndims);
     gate += x_off;
     up   += x_off;
   }

@@ -1837,8 +1837,10 @@ void fast::FusedSwiGLUGatherQMV::eval_gpu(
   // Use rhs_indices as lhs_indices too — they parallel-index gate/up.
   const array& lhs_indices = rhs_indices;
 
+  // Each gather slot is a single matvec: M=1 inner row, K=in_vec_size,
+  // N=out_vec_size. The "batch" dim B = number of gather slots.
   int K = gate.shape(-1);
-  int M = gate.shape(-2);
+  int M = 1;
   int N = out.shape(-1);
   auto mode = mode_;
 
