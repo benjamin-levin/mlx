@@ -1813,4 +1813,44 @@ void fast::ConvertFP8::eval_gpu(
   unary_op_gpu(inputs, out, name(), stream());
 }
 
+void fast::FusedSwiGLUGatherQMV::eval_gpu(
+    const std::vector<array>& inputs,
+    std::vector<array>& outputs) {
+  // Inputs: [gate, up, w, scales, (biases?), rhs_indices]
+  // The lhs_indices is implicit — we use rhs_indices for both, since
+  // each k_slot maps gate[k]/up[k] to expert rhs_indices[k].
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+  auto& out = outputs[0];
+  out.set_data(allocator::malloc(out.nbytes()));
+
+  bool has_biases = (inputs.size() == 6);
+  array gate = ensure_row_contiguous_matrix(inputs[0], d, s);
+  array up = ensure_row_contiguous_matrix(inputs[1], d, s);
+  array w = ensure_row_contiguous_matrix(inputs[2], d, s);
+  array scales = ensure_row_contiguous_matrix(inputs[3], d, s);
+  std::optional<array> biases = std::nullopt;
+  if (has_biases) {
+    biases = ensure_row_contiguous_matrix(inputs[4], d, s);
+  }
+  const array& rhs_indices = inputs[inputs.size() - 1];
+  // Use rhs_indices as lhs_indices too — they parallel-index gate/up.
+  const array& lhs_indices = rhs_indices;
+
+  int K = gate.shape(-1);
+  int M = gate.shape(-2);
+  int N = out.shape(-1);
+  auto mode = mode_;
+
+  gather_qmv_swiglu(
+      gate, up, w, scales, biases,
+      lhs_indices, rhs_indices, out,
+      group_size_, bits_, M, N, K, d, s, mode);
+}
+
+bool fast::FusedSwiGLUGatherQMV::is_equivalent(const Primitive& other) const {
+  const auto& o = static_cast<const FusedSwiGLUGatherQMV&>(other);
+  return group_size_ == o.group_size_ && bits_ == o.bits_ && mode_ == o.mode_;
+}
+
 } // namespace mlx::core
