@@ -104,6 +104,120 @@ inline U load_vector(const device T* x, thread U* x_thread) {
   return sum;
 }
 
+// ---------------------------------------------------------------------------
+// load_vector_swiglu: variant of load_vector that takes TWO input streams
+// (gate, up) and applies SwiGLU activation silu(gate) * up inline before
+// the divide-by-16/256/4096 trick. Used by qmv_fast_swiglu_impl for the
+// fused SwiGLU+gather_qmv kernel.
+// ---------------------------------------------------------------------------
+template <typename T, typename U, int values_per_thread, int bits>
+inline U load_vector_swiglu(
+    const device T* gate,
+    const device T* up,
+    thread U* x_thread) {
+  static_assert(
+      bits == 2 || bits == 3 || bits == 4 || bits == 5 || bits == 6 ||
+          bits == 8,
+      "Template undefined for bits not in {2, 3, 4, 5, 6, 8}");
+
+  U sum = 0;
+
+  // SwiGLU: activated[i] = gate[i] * sigmoid(gate[i]) * up[i]
+  // Use a small helper macro to keep the per-i computation tight.
+#define _SWIGLU_AT(i_off) \
+  do {                                                           \
+    U gv = static_cast<U>(gate[(i_off)]);                        \
+    U uv = static_cast<U>(up[(i_off)]);                          \
+    U sig = static_cast<U>(1.0) /                                \
+            (static_cast<U>(1.0) + metal::exp(-gv));             \
+    a[(i_off)] = gv * sig * uv;                                  \
+  } while (0)
+
+  if (bits == 2) {
+    U a[values_per_thread];
+    for (int i = 0; i < values_per_thread; i += 4) {
+      _SWIGLU_AT(i + 0); _SWIGLU_AT(i + 1); _SWIGLU_AT(i + 2); _SWIGLU_AT(i + 3);
+      sum += a[i] + a[i + 1] + a[i + 2] + a[i + 3];
+      x_thread[i]     = a[i];
+      x_thread[i + 1] = a[i + 1] / 4.0f;
+      x_thread[i + 2] = a[i + 2] / 16.0f;
+      x_thread[i + 3] = a[i + 3] / 64.0f;
+    }
+  }
+
+  else if (bits == 3) {
+    U a[values_per_thread];
+    for (int i = 0; i < values_per_thread; i += 8) {
+      for (int k = 0; k < 8; k++) _SWIGLU_AT(i + k);
+      sum += a[i] + a[i + 1] + a[i + 2] + a[i + 3] + a[i + 4] + a[i + 5] +
+             a[i + 6] + a[i + 7];
+      x_thread[i]     = a[i];
+      x_thread[i + 1] = a[i + 1] / 8.0f;
+      x_thread[i + 2] = a[i + 2] / 64.0f;
+      x_thread[i + 3] = a[i + 3] / 2.0f;
+      x_thread[i + 4] = a[i + 4] / 16.0f;
+      x_thread[i + 5] = a[i + 5] / 128.0f;
+      x_thread[i + 6] = a[i + 6] / 4.0f;
+      x_thread[i + 7] = a[i + 7] / 32.0f;
+    }
+  }
+
+  else if (bits == 4) {
+    U a[values_per_thread];
+    for (int i = 0; i < values_per_thread; i += 4) {
+      _SWIGLU_AT(i + 0); _SWIGLU_AT(i + 1); _SWIGLU_AT(i + 2); _SWIGLU_AT(i + 3);
+      sum += a[i] + a[i + 1] + a[i + 2] + a[i + 3];
+      x_thread[i]     = a[i];
+      x_thread[i + 1] = a[i + 1] / 16.0f;
+      x_thread[i + 2] = a[i + 2] / 256.0f;
+      x_thread[i + 3] = a[i + 3] / 4096.0f;
+    }
+  }
+
+  else if (bits == 5) {
+    U a[values_per_thread];
+    for (int i = 0; i < values_per_thread; i += 8) {
+      for (int k = 0; k < 8; k++) _SWIGLU_AT(i + k);
+      sum += a[i] + a[i + 1] + a[i + 2] + a[i + 3] + a[i + 4] + a[i + 5] +
+             a[i + 6] + a[i + 7];
+      x_thread[i]     = a[i];
+      x_thread[i + 1] = a[i + 1] / 32.0f;
+      x_thread[i + 2] = a[i + 2] / 4.0f;
+      x_thread[i + 3] = a[i + 3] / 128.0f;
+      x_thread[i + 4] = a[i + 4] / 16.0f;
+      x_thread[i + 5] = a[i + 5] / 2.0f;
+      x_thread[i + 6] = a[i + 6] / 64.0f;
+      x_thread[i + 7] = a[i + 7] / 8.0f;
+    }
+  }
+
+  else if (bits == 6) {
+    U a[values_per_thread];
+    for (int i = 0; i < values_per_thread; i += 4) {
+      _SWIGLU_AT(i + 0); _SWIGLU_AT(i + 1); _SWIGLU_AT(i + 2); _SWIGLU_AT(i + 3);
+      sum += a[i] + a[i + 1] + a[i + 2] + a[i + 3];
+      x_thread[i]     = a[i];
+      x_thread[i + 1] = a[i + 1] / 64.0f;
+      x_thread[i + 2] = a[i + 2] / 16.0f;
+      x_thread[i + 3] = a[i + 3] / 4.0f;
+    }
+  }
+
+  else if (bits == 8) {
+    for (int i = 0; i < values_per_thread; i++) {
+      U gv = static_cast<U>(gate[i]);
+      U uv = static_cast<U>(up[i]);
+      U sig = static_cast<U>(1.0) / (static_cast<U>(1.0) + metal::exp(-gv));
+      U av = gv * sig * uv;
+      sum += av;
+      x_thread[i] = av;
+    }
+  }
+
+#undef _SWIGLU_AT
+  return sum;
+}
+
 template <typename T, typename U, int values_per_thread, int bits>
 inline U load_vector_safe(const device T* x, thread U* x_thread, int N) {
   static_assert(
@@ -803,6 +917,85 @@ METAL_FUNC void qmv_fast_impl(
     scales += block_size / group_size;
     biases += block_size / group_size;
     x += block_size;
+  }
+
+  for (int row = 0; row < results_per_simdgroup; row++) {
+    result[row] = simd_sum(result[row]);
+    if (simd_lid == 0) {
+      y[row] = static_cast<T>(result[row]);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// qmv_fast_swiglu_impl: variant of qmv_fast_impl that takes TWO input vectors
+// (gate, up) and applies SwiGLU activation silu(gate) * up inline before the
+// quantized matmul. Saves materializing the activated intermediate (and the
+// associated kernel launch for silu+multiply).
+//
+// Mirrors qmv_fast_impl exactly except the load_vector call is replaced with
+// load_vector_swiglu and we step BOTH gate and up pointers each block.
+// ---------------------------------------------------------------------------
+template <typename T, int group_size, int bits>
+METAL_FUNC void qmv_fast_swiglu_impl(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* gate,
+    const device T* up,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int packs_per_thread = bits == 2 ? 1 : 2;
+  constexpr int num_simdgroups = 2;
+  constexpr int results_per_simdgroup = 4;
+  constexpr int pack_factor = get_pack_factor<bits, 32>();
+  constexpr int bytes_per_pack = get_bytes_per_pack<bits, 32>();
+  constexpr int values_per_thread = pack_factor * packs_per_thread;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int scale_step_per_thread = group_size / values_per_thread;
+
+  const device uint8_t* ws = (const device uint8_t*)w;
+
+  typedef float U;
+
+  thread U x_thread[values_per_thread];
+  thread U result[results_per_simdgroup] = {0};
+
+  const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
+  const int in_vec_size_g = in_vec_size / group_size;
+  const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
+      simd_gid * results_per_simdgroup;
+
+  ws += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
+  scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  gate += tid.x * in_vec_size + simd_lid * values_per_thread;
+  up   += tid.x * in_vec_size + simd_lid * values_per_thread;
+  y += tid.x * out_vec_size + out_row;
+
+  for (int k = 0; k < in_vec_size; k += block_size) {
+    U sum = load_vector_swiglu<T, U, values_per_thread, bits>(
+        gate, up, x_thread);
+
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
+      const device T* sl = scales + row * in_vec_size_g;
+      const device T* bl = biases + row * in_vec_size_g;
+
+      U s = sl[0];
+      U b = bl[0];
+      result[row] += qdot<U, values_per_thread, bits>(wl, x_thread, s, b, sum);
+    }
+
+    ws += block_size * bytes_per_pack / pack_factor;
+    scales += block_size / group_size;
+    biases += block_size / group_size;
+    gate += block_size;
+    up   += block_size;
   }
 
   for (int row = 0; row < results_per_simdgroup; row++) {
@@ -1950,6 +2143,98 @@ template <typename T, int group_size, int bits>
       scales,
       biases,
       x,
+      y,
+      in_vec_size,
+      out_vec_size,
+      tid,
+      simd_gid,
+      simd_lid);
+}
+
+// ---------------------------------------------------------------------------
+// affine_gather_qmv_swiglu: fused SwiGLU + gather quantized matvec.
+//
+// Takes two input buffers (gate, up) instead of one. Applies
+//   silu(gate) * up
+// inline before the standard qmv_fast accumulation, saving one separate
+// elementwise launch and the materialization of the intermediate.
+//
+// Buffer layout matches affine_gather_qmv_fast except buffer(3) is gate,
+// buffer(4) is up, and the lhs_indices slot becomes buffer(5). rhs_indices
+// stays at buffer(6) and the output at buffer(7) (shifted by one to make
+// room for the second input).
+// ---------------------------------------------------------------------------
+template <typename T, int group_size, int bits>
+[[kernel]] void affine_gather_qmv_swiglu(
+    const device uint32_t* w [[buffer(0)]],
+    const device T* scales [[buffer(1)]],
+    const device T* biases [[buffer(2)]],
+    const device T* gate [[buffer(3)]],
+    const device T* up [[buffer(4)]],
+    const device uint32_t* lhs_indices [[buffer(5)]],
+    const device uint32_t* rhs_indices [[buffer(6)]],
+    device T* y [[buffer(7)]],
+    const constant int& in_vec_size [[buffer(8)]],
+    const constant int& out_vec_size [[buffer(9)]],
+    const constant int& x_batch_ndims [[buffer(10)]],
+    const constant int* x_shape [[buffer(11)]],
+    const constant int64_t* x_strides [[buffer(12)]],
+    const constant int& w_batch_ndims [[buffer(13)]],
+    const constant int* w_shape [[buffer(14)]],
+    const constant int64_t* w_strides [[buffer(15)]],
+    const constant int64_t* s_strides [[buffer(16)]],
+    const constant int64_t* b_strides [[buffer(17)]],
+    const constant int& batch_ndims [[buffer(18)]],
+    const constant int* batch_shape [[buffer(19)]],
+    const constant int64_t* lhs_strides [[buffer(20)]],
+    const constant int64_t* rhs_strides [[buffer(21)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  int M = x_shape[x_batch_ndims];
+  // Inline the gather offsets so we can apply the SAME x-offset to BOTH
+  // gate and up (which share strides). This mirrors adjust_matrix_offsets
+  // for the gather case (the second overload at line ~1582).
+  uint32_t x_idx;
+  uint32_t w_idx;
+  if (batch_ndims == 1) {
+    x_idx = lhs_indices[tid.z * lhs_strides[0]];
+    w_idx = rhs_indices[tid.z * rhs_strides[0]];
+  } else {
+    ulong2 bidx = elem_to_loc_broadcast(
+        tid.z, batch_shape, lhs_strides, rhs_strides, batch_ndims);
+    x_idx = lhs_indices[bidx.x];
+    w_idx = rhs_indices[bidx.y];
+  }
+  // Offset both gate and up by the same x_idx
+  if (x_batch_ndims == 1) {
+    gate += x_idx * x_strides[0];
+    up   += x_idx * x_strides[0];
+  } else {
+    auto x_off = elem_to_loc(x_idx, x_shape, x_strides, x_batch_ndims);
+    gate += x_off;
+    up   += x_off;
+  }
+  // Offset w/scales/biases by w_idx
+  if (w_batch_ndims == 1) {
+    w += w_idx * w_strides[0];
+    scales += w_idx * s_strides[0];
+    biases += w_idx * b_strides[0];
+  } else {
+    ulong3 widx = elem_to_loc_broadcast(
+        w_idx, w_shape, w_strides, s_strides, b_strides, w_batch_ndims);
+    w += widx.x;
+    scales += widx.y;
+    biases += widx.z;
+  }
+  y += tid.z * out_vec_size * M;
+
+  qmv_fast_swiglu_impl<T, group_size, bits>(
+      w,
+      scales,
+      biases,
+      gate,
+      up,
       y,
       in_vec_size,
       out_vec_size,
