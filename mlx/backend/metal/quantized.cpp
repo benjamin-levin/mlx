@@ -1850,9 +1850,4 @@ void fast::FusedSwiGLUGatherQMV::eval_gpu(
       group_size_, bits_, M, N, K, d, s, mode);
 }
 
-bool fast::FusedSwiGLUGatherQMV::is_equivalent(const Primitive& other) const {
-  const auto& o = static_cast<const FusedSwiGLUGatherQMV&>(other);
-  return group_size_ == o.group_size_ && bits_ == o.bits_ && mode_ == o.mode_;
-}
-
 } // namespace mlx::core

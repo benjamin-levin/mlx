@@ -172,6 +172,7 @@ NO_GPU_MULTI(ScaledDotProductAttentionVJP)
 NO_GPU_MULTI(ConvertFP8)
 NO_GPU_MULTI(Quantize)
 NO_GPU_MULTI(CustomKernel)
+NO_GPU_MULTI(FusedSwiGLUGatherQMV)
 } // namespace fast
 
 namespace distributed {
