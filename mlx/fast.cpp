@@ -922,6 +922,15 @@ bool ScaledDotProductAttentionVJP::is_equivalent(const Primitive& other) const {
       has_sinks_ == a_other.has_sinks_;
 }
 
+bool FusedQSDPA::is_equivalent(const Primitive& other) const {
+  const auto& o = static_cast<const FusedQSDPA&>(other);
+  return scale_ == o.scale_ && group_size_ == o.group_size_ &&
+      bits_ == o.bits_ && head_dim_ == o.head_dim_ &&
+      gqa_factor_ == o.gqa_factor_ && has_mask_ == o.has_mask_ &&
+      do_causal_ == o.do_causal_ && has_left_padding_ == o.has_left_padding_ &&
+      mode_ == o.mode_;
+}
+
 bool Quantize::is_equivalent(const Primitive& other) const {
   const Quantize& p_other = static_cast<const Quantize&>(other);
   return (
@@ -953,6 +962,136 @@ std::vector<Shape> Quantize::output_shapes(const std::vector<array>& inputs) {
 bool ConvertFP8::is_equivalent(const Primitive& other) const {
   const ConvertFP8& a_other = static_cast<const ConvertFP8&>(other);
   return to_fp8_ == a_other.to_fp8_;
+}
+
+// =========================================================================
+// Fused quantized SDPA (2-pass with GQA-shared K/V loads).
+// =========================================================================
+// eval_gpu lives in mlx/backend/metal/quantized.cpp; is_equivalent above
+// anchors the vtable so CPU-only builds link cleanly.
+
+array fused_qsdpa(
+    const array& queries,
+    const array& q_keys_packed,
+    const array& q_keys_scales,
+    const array& q_keys_biases,
+    const array& q_values_packed,
+    const array& q_values_scales,
+    const array& q_values_biases,
+    float scale,
+    const std::optional<array>& mask /* = std::nullopt */,
+    int group_size /* = 64 */,
+    int bits /* = 4 */,
+    int head_dim /* = 256 */,
+    int gqa_factor /* = 8 */,
+    bool do_causal /* = false */,
+    const std::optional<array>& left_padding /* = std::nullopt */,
+    const std::string& mode /* = "affine" */,
+    StreamOrDevice s_ /* = {} */) {
+  auto s = to_stream(s_);
+
+  if (queries.ndim() != 4) {
+    throw std::invalid_argument(
+        "[fused_qsdpa] queries must have shape (B, n_q_heads, T_q, D)");
+  }
+  if (q_keys_packed.ndim() != 4) {
+    throw std::invalid_argument(
+        "[fused_qsdpa] q_keys_packed must have shape (B, n_kv_heads, T_kv, D/EL_PER_INT)");
+  }
+  if (queries.shape(3) != head_dim) {
+    throw std::invalid_argument(
+        "[fused_qsdpa] queries.shape(-1) must equal head_dim");
+  }
+  if (queries.shape(2) != 1) {
+    throw std::invalid_argument(
+        "[fused_qsdpa] only T_q == 1 (decode) is supported");
+  }
+  if (queries.dtype() != q_keys_scales.dtype() ||
+      queries.dtype() != q_keys_biases.dtype() ||
+      queries.dtype() != q_values_scales.dtype() ||
+      queries.dtype() != q_values_biases.dtype()) {
+    throw std::invalid_argument(
+        "[fused_qsdpa] queries / scales / biases must share dtype");
+  }
+  if (bits != 4 && bits != 8) {
+    throw std::invalid_argument("[fused_qsdpa] bits must be 4 or 8");
+  }
+  if (group_size != 32 && group_size != 64) {
+    throw std::invalid_argument("[fused_qsdpa] group_size must be 32 or 64");
+  }
+  if (head_dim != 256) {
+    throw std::invalid_argument(
+        "[fused_qsdpa] only head_dim == 256 supported in this build");
+  }
+  if (gqa_factor != 8) {
+    throw std::invalid_argument(
+        "[fused_qsdpa] only gqa_factor == 8 supported in this build");
+  }
+  if (mode != "affine") {
+    throw std::invalid_argument("[fused_qsdpa] only mode=='affine' supported");
+  }
+
+  bool has_mask = mask.has_value();
+  bool has_left_padding = left_padding.has_value();
+  // For now, only causal masks are accepted; arbitrary masks should fall
+  // back at the dispatch layer in Python. The left_padding parameter is
+  // a separate code path (per-batch leading-mask scalar) and does not go
+  // through the mask check below.
+  if (has_mask && !do_causal) {
+    throw std::invalid_argument(
+        "[fused_qsdpa] arbitrary masks not supported; "
+        "use do_causal=True or left_padding=array(...), or fall back to v3");
+  }
+  if (has_left_padding) {
+    // left_padding must be a 1-D int32 array of length B (the batch).
+    if (left_padding->ndim() != 1) {
+      throw std::invalid_argument(
+          "[fused_qsdpa] left_padding must be a 1-D array of shape (B,)");
+    }
+    if (left_padding->dtype() != int32) {
+      throw std::invalid_argument(
+          "[fused_qsdpa] left_padding must have dtype int32");
+    }
+    if (left_padding->shape(0) != queries.shape(0)) {
+      throw std::invalid_argument(
+          "[fused_qsdpa] left_padding.shape(0) must equal queries batch dim");
+    }
+  }
+
+  auto out_shape = queries.shape();
+  // (B, n_q_heads, T_q, D) -- unchanged.
+
+  std::vector<array> inputs = {
+      queries,
+      q_keys_packed,
+      q_keys_scales,
+      q_keys_biases,
+      q_values_packed,
+      q_values_scales,
+      q_values_biases};
+  if (has_mask) {
+    inputs.push_back(*mask);
+  }
+  if (has_left_padding) {
+    inputs.push_back(*left_padding);
+  }
+
+  return array(
+      std::move(out_shape),
+      queries.dtype(),
+      std::make_shared<FusedQSDPA>(
+          s,
+          /* fallback */ nullptr,
+          scale,
+          group_size,
+          bits,
+          head_dim,
+          gqa_factor,
+          has_mask,
+          do_causal,
+          has_left_padding,
+          mode),
+      std::move(inputs));
 }
 
 } // namespace mlx::core::fast
