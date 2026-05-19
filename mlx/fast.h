@@ -133,6 +133,28 @@ MLX_API array fused_qsdpa(
     int gqa_factor = 8,
     bool do_causal = false,
     const std::optional<array>& left_padding = std::nullopt,
+ * Fused SiLU(gate) * up + gather quantized matvec.
+ *
+ * Computes:  out = (silu(gate) * up) @ w[rhs_indices[k]]^T
+ * where the matmul is the same as gather_qmm in matvec (M=1) mode.
+ *
+ * Requires:
+ *   - gate, up: same shape (..., M, K_in), same dtype
+ *   - w: (E, N_out, K_in / pack_factor) uint32 (4-bit packed)
+ *   - scales, biases: (E, N_out, K_in / group_size) dtype matching gate
+ *   - rhs_indices: int32, broadcastable to gate's batch dims
+ *
+ * Currently only the fast path is implemented (N % 8 == 0 && K % 512 == 0).
+ */
+MLX_API array fused_swiglu_gather_qmv(
+    const array& gate,
+    const array& up,
+    const array& w,
+    const array& scales,
+    const std::optional<array>& biases,
+    const array& rhs_indices,
+    int group_size = 64,
+    int bits = 4,
     const std::string& mode = "affine",
     StreamOrDevice s = {});
 

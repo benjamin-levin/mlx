@@ -699,5 +699,64 @@ void init_fast(nb::module_& parent_module) {
 
         Returns:
           array: shape (B, n_q_heads, T_q, head_dim).
+      "fused_swiglu_gather_qmv",
+      [](const mx::array& gate,
+         const mx::array& up,
+         const mx::array& w,
+         const mx::array& scales,
+         const std::optional<mx::array>& biases,
+         const mx::array& rhs_indices,
+         int group_size,
+         int bits,
+         const std::string& mode,
+         mx::StreamOrDevice s) {
+        return mx::fast::fused_swiglu_gather_qmv(
+            gate,
+            up,
+            w,
+            scales,
+            biases,
+            rhs_indices,
+            group_size,
+            bits,
+            mode,
+            s);
+      },
+      "gate"_a,
+      "up"_a,
+      "w"_a,
+      "scales"_a,
+      "biases"_a = nb::none(),
+      "rhs_indices"_a,
+      nb::kw_only(),
+      "group_size"_a = 64,
+      "bits"_a = 4,
+      "mode"_a = "affine",
+      "stream"_a = nb::none(),
+      nb::sig(
+          "def fused_swiglu_gather_qmv(gate: array, up: array, w: array, scales: array, biases: Optional[array], rhs_indices: array, *, group_size: int = 64, bits: int = 4, mode: str = 'affine', stream: Union[None, Stream, Device] = None) -> array"),
+      R"pbdoc(
+        Fused SiLU(gate) * up + gather quantized matvec.
+
+        Replaces the three-step sequence
+        ``y = mx.gather_qmm(mx.silu(gate) * up, w, scales, biases, rhs_indices=...)``
+        with a single Metal kernel that applies the SwiGLU activation inline
+        before the quantized matmul, skipping the intermediate activated
+        tensor.
+
+        Args:
+          gate (array): Gate input, shape (..., M, K).
+          up (array): Up input, same shape and dtype as gate.
+          w (array): Packed quantized weight, shape (E, N, K/pack_factor).
+          scales (array): Quant scales, shape (E, N, K/group_size).
+          biases (array, optional): Quant biases, same shape as scales.
+          rhs_indices (array): uint32 indices selecting experts.
+          group_size (int): Quant group size. Default: 64.
+          bits (int): Quant bits. Default: 4.
+          mode (str): Quant mode. Default: ``"affine"``.
+          stream (Stream, optional): Stream to dispatch on.
+
+        Returns:
+          array: shape (..., M, N).
       )pbdoc");
 }

@@ -1317,6 +1317,186 @@ class TestFast(mlx_tests.MLXTestCase):
                 left_padding=mx.zeros((B, 2), dtype=mx.int32),
             )
             mx.eval(out)
+    # fused_swiglu_gather_qmv
+    # ------------------------------------------------------------------
+
+    def _fused_swiglu_ref(self, gate, up, qw, scales, biases, rhs_indices):
+        # Reference path: explicit silu(gate) * up, then gather_qmm matvec.
+        activated = mx.silu(gate) * up
+        return mx.gather_qmm(
+            activated,
+            qw,
+            scales,
+            biases,
+            rhs_indices=rhs_indices,
+            transpose=True,
+        )
+
+    @unittest.skipIf(not mx.metal.is_available(), "Metal is not available")
+    def test_fused_swiglu_gather_qmv_correctness(self):
+        # Fast path requires N % 8 == 0 and K % 512 == 0.
+        mx.random.seed(0)
+        E = 4  # num experts
+        K = 512
+        N = 128
+        M = 1  # decode
+        group_size = 64
+        bits = 4
+
+        for dtype in (mx.float16, mx.bfloat16):
+            with self.subTest(dtype=dtype):
+                gate = mx.random.normal(shape=(2, M, K)).astype(dtype)
+                up = mx.random.normal(shape=(2, M, K)).astype(dtype)
+                w = mx.random.normal(shape=(E, N, K)).astype(dtype)
+                qw, s_, b_ = mx.quantize(w, group_size=group_size, bits=bits)
+                rhs_indices = mx.array([2, 1], dtype=mx.uint32)
+
+                ref = self._fused_swiglu_ref(gate, up, qw, s_, b_, rhs_indices)
+                out = mx.fast.fused_swiglu_gather_qmv(
+                    gate,
+                    up,
+                    qw,
+                    s_,
+                    b_,
+                    rhs_indices,
+                    group_size=group_size,
+                    bits=bits,
+                )
+                self.assertEqual(out.shape, ref.shape)
+                self.assertEqual(out.dtype, ref.dtype)
+
+                a = out.astype(mx.float32).flatten()
+                b = ref.astype(mx.float32).flatten()
+                cos = (a * b).sum() / (mx.linalg.norm(a) * mx.linalg.norm(b) + 1e-12)
+                self.assertGreaterEqual(cos.item(), 0.9999)
+
+    @unittest.skipIf(not mx.metal.is_available(), "Metal is not available")
+    def test_fused_swiglu_gather_qmv_shapes(self):
+        # Exercise a few small (B, M, K_in, N_out, E) shapes -- all on the
+        # fast path (N % 8 == 0 && K % 512 == 0).
+        mx.random.seed(0)
+        group_size = 64
+        bits = 4
+        dtype = mx.float16
+
+        shapes = [
+            # (B, M, K, N, E)
+            (1, 1, 512, 128, 4),
+            (2, 1, 512, 128, 8),
+            (3, 1, 1024, 256, 8),
+            (4, 1, 512, 64, 8),
+        ]
+
+        for B, M, K, N, E in shapes:
+            with self.subTest(B=B, M=M, K=K, N=N, E=E):
+                gate = mx.random.normal(shape=(B, M, K)).astype(dtype)
+                up = mx.random.normal(shape=(B, M, K)).astype(dtype)
+                w = mx.random.normal(shape=(E, N, K)).astype(dtype)
+                qw, s_, b_ = mx.quantize(w, group_size=group_size, bits=bits)
+                rhs_indices = mx.array([i % E for i in range(B)], dtype=mx.uint32)
+
+                out = mx.fast.fused_swiglu_gather_qmv(
+                    gate,
+                    up,
+                    qw,
+                    s_,
+                    b_,
+                    rhs_indices,
+                    group_size=group_size,
+                    bits=bits,
+                )
+                self.assertEqual(out.shape, (B, M, N))
+                self.assertEqual(out.dtype, dtype)
+
+                ref = self._fused_swiglu_ref(gate, up, qw, s_, b_, rhs_indices)
+                a = out.astype(mx.float32).flatten()
+                b_flat = ref.astype(mx.float32).flatten()
+                cos = (a * b_flat).sum() / (
+                    mx.linalg.norm(a) * mx.linalg.norm(b_flat) + 1e-12
+                )
+                self.assertGreaterEqual(cos.item(), 0.9999)
+
+    @unittest.skipIf(not mx.metal.is_available(), "Metal is not available")
+    def test_fused_swiglu_gather_qmv_input_validation(self):
+        mx.random.seed(0)
+        E = 4
+        K = 512
+        N = 128
+        M = 1
+        group_size = 64
+        bits = 4
+        dtype = mx.float16
+
+        gate = mx.random.normal(shape=(2, M, K)).astype(dtype)
+        up = mx.random.normal(shape=(2, M, K)).astype(dtype)
+        w = mx.random.normal(shape=(E, N, K)).astype(dtype)
+        qw, s_, b_ = mx.quantize(w, group_size=group_size, bits=bits)
+        rhs_indices = mx.array([0, 1], dtype=mx.uint32)
+
+        # 1) mismatched gate/up shape
+        with self.assertRaises(Exception):
+            bad_up = mx.random.normal(shape=(2, M, K // 2)).astype(dtype)
+            mx.eval(
+                mx.fast.fused_swiglu_gather_qmv(
+                    gate,
+                    bad_up,
+                    qw,
+                    s_,
+                    b_,
+                    rhs_indices,
+                    group_size=group_size,
+                    bits=bits,
+                )
+            )
+
+        # 2) mismatched gate/up dtype
+        with self.assertRaises(Exception):
+            bad_up_dtype = up.astype(mx.float32)
+            mx.eval(
+                mx.fast.fused_swiglu_gather_qmv(
+                    gate,
+                    bad_up_dtype,
+                    qw,
+                    s_,
+                    b_,
+                    rhs_indices,
+                    group_size=group_size,
+                    bits=bits,
+                )
+            )
+
+        # 3) non-uint32 rhs_indices
+        with self.assertRaises(Exception):
+            bad_idx = mx.array([0, 1], dtype=mx.int32)
+            mx.eval(
+                mx.fast.fused_swiglu_gather_qmv(
+                    gate,
+                    up,
+                    qw,
+                    s_,
+                    b_,
+                    bad_idx,
+                    group_size=group_size,
+                    bits=bits,
+                )
+            )
+
+        # 4) gate with too few dims (must be >= 2)
+        with self.assertRaises(Exception):
+            tiny_gate = mx.random.normal(shape=(K,)).astype(dtype)
+            tiny_up = mx.random.normal(shape=(K,)).astype(dtype)
+            mx.eval(
+                mx.fast.fused_swiglu_gather_qmv(
+                    tiny_gate,
+                    tiny_up,
+                    qw,
+                    s_,
+                    b_,
+                    rhs_indices,
+                    group_size=group_size,
+                    bits=bits,
+                )
+            )
 
 
 if __name__ == "__main__":
