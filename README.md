@@ -1,3 +1,38 @@
+# `benjamin-levin/mlx` — fork of [`ml-explore/mlx`](https://github.com/ml-explore/mlx)
+
+> **Interim fork**: carries two in-flight upstream draft PRs assembled into `main` so users can install the stack as one piece while the PRs land upstream individually. Will be retired once both PRs merge into `ml-explore/mlx`.
+
+## What's different from upstream
+
+| Addition | Effect | Draft PR |
+|---|---|---|
+| **`mx.fast.fused_qsdpa`** — compiled-in 2-pass FlashAttention on a quantized KV cache. Cooperative tile-shared dequant across all GQA heads inside the Metal kernel; bit-exact vs `mx.fast.scaled_dot_product_attention(bf16)` on dequantized K/V. Decode-shape only (`T_q=1`), `head_dim=256`, `gqa_factor=8`, `bits ∈ {4,8}`, `group_size ∈ {32,64}`. | +18% e2e @ 32k N=1, +27% @ 96k N=1 on Qwen3.6-35B-A3B-4bit (M4 Max 36 GB). `left_padding` extension recovers +22.8% on heterogeneous-prompt N=3 32k batches. | [#1](https://github.com/benjamin-levin/mlx/pull/1) |
+| **`mx.fast.fused_swiglu_gather_qmv`** — single Metal kernel fusing `silu(gate) * up` activation inline with the quantized `gather_qmm` matvec. Fast-path: `N % 8 == 0 && K % 512 == 0`, affine quantization. | ~1.05× microbench geomean across 27 shapes vs the explicit three-launch reference. Bit-exact correctness (cos ≥ 0.9999). | [#2](https://github.com/benjamin-levin/mlx/pull/2) |
+
+### Why these exist on Apple Silicon
+
+The M4 series and below have **no native int4 / int8 GPU matmul instructions** — M5's Neural Accelerators added these, but anything M4 or earlier dequantizes every quantized weight to bf16 in registers before the matmul fires, on every use. KV-quantization in particular only pays off when the dequant is fused into the attention kernel; the stock 3-launch quantized-SDPA path is actually *slower* than bf16 SDPA at long context because each launch redoes the dequant. `fused_qsdpa` is the structural fix: cooperative dequant inside a 2-pass FlashAttention kernel, shared across GQA query heads. `fused_swiglu_gather_qmv` collapses three launches into one to amortize the same overhead in the MoE expert path.
+
+## Install
+
+```bash
+pip install git+https://github.com/benjamin-levin/mlx.git@main
+```
+
+Requires Xcode CLT + CMake; ~5–10 min build on M-series.
+
+For the full Python-level stack on top of this (scheduler-fix, MTP spec decode, persistent prompt cache, SnapKV, etc.), install the matching mlx-lm fork — `setup.py` will pull this fork automatically:
+
+```bash
+pip install git+https://github.com/benjamin-levin/mlx-lm.git@main
+```
+
+## Context
+
+These changes were extracted from an [optimization study](https://github.com/benjamin-levin/mlx-fast) of 28 strategies attempted on Qwen3.6-35B-A3B-4bit on M4 Max (13 shipped, 15 documented as dead ends, with per-strategy methodology + measurement). See each PR's body for full per-feature methodology, in-PR re-measurement, and any honest corrections vs originally-claimed wins.
+
+---
+
 # MLX
 
 [**Quickstart**](#quickstart) | [**Installation**](#installation) |
