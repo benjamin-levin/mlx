@@ -424,4 +424,40 @@ class CustomKernel : public Primitive {
   int shared_memory_;
 };
 
+// Fused SiLU(gate) * up + gather quantized matvec.
+// Inputs: [gate, up, w, scales, biases?, rhs_indices]
+// Output: [y] of shape (B, K, N) where N = out_vec_size.
+class FusedSwiGLUGatherQMV : public Custom {
+ public:
+  FusedSwiGLUGatherQMV(
+      Stream stream,
+      std::function<std::vector<array>(std::vector<array>)> fallback,
+      int group_size,
+      int bits,
+      const std::string& mode)
+      : Custom(stream, std::move(fallback)),
+        group_size_(group_size),
+        bits_(bits),
+        mode_(mode) {}
+
+  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override {
+    throw std::runtime_error("FusedSwiGLUGatherQMV: CPU not implemented");
+  }
+  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+
+  DEFINE_NAME(FusedSwiGLUGatherQMV)
+  bool is_equivalent(const Primitive& other) const override;
+
+  auto state() const {
+    return std::make_tuple(group_size_, bits_, mode_);
+  }
+
+ private:
+  int group_size_;
+  int bits_;
+  std::string mode_;
+};
+
 } // namespace mlx::core::fast

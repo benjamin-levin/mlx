@@ -922,6 +922,11 @@ bool ScaledDotProductAttentionVJP::is_equivalent(const Primitive& other) const {
       has_sinks_ == a_other.has_sinks_;
 }
 
+bool FusedSwiGLUGatherQMV::is_equivalent(const Primitive& other) const {
+  const auto& o = static_cast<const FusedSwiGLUGatherQMV&>(other);
+  return group_size_ == o.group_size_ && bits_ == o.bits_ && mode_ == o.mode_;
+}
+
 bool Quantize::is_equivalent(const Primitive& other) const {
   const Quantize& p_other = static_cast<const Quantize&>(other);
   return (
@@ -953,6 +958,62 @@ std::vector<Shape> Quantize::output_shapes(const std::vector<array>& inputs) {
 bool ConvertFP8::is_equivalent(const Primitive& other) const {
   const ConvertFP8& a_other = static_cast<const ConvertFP8&>(other);
   return to_fp8_ == a_other.to_fp8_;
+}
+
+// =========================================================================
+// Fused SiLU(gate)*up + gather_qmv
+// =========================================================================
+
+array fused_swiglu_gather_qmv(
+    const array& gate,
+    const array& up,
+    const array& w,
+    const array& scales,
+    const std::optional<array>& biases,
+    const array& rhs_indices,
+    int group_size /* = 64 */,
+    int bits /* = 4 */,
+    const std::string& mode /* = "affine" */,
+    StreamOrDevice s_ /* = {} */) {
+  auto s = to_stream(s_);
+  if (gate.shape() != up.shape()) {
+    std::ostringstream m;
+    m << "[fused_swiglu_gather_qmv] gate and up must have the same shape, "
+      << "got gate shape " << gate.shape() << " and up shape " << up.shape();
+    throw std::invalid_argument(m.str());
+  }
+  if (gate.dtype() != up.dtype()) {
+    throw std::invalid_argument(
+        "[fused_swiglu_gather_qmv] gate and up must have the same dtype");
+  }
+  if (rhs_indices.dtype() != uint32) {
+    throw std::invalid_argument(
+        "[fused_swiglu_gather_qmv] rhs_indices must be uint32");
+  }
+
+  // Output shape: gate is (..., M, K_in), w is (E, N_out, K_in/pack) packed.
+  // Caller must pass gate/up with shape (..., M, K_in) — for decode M=1.
+  // Output: (..., M, N_out).
+  if (gate.ndim() < 2) {
+    throw std::invalid_argument(
+        "[fused_swiglu_gather_qmv] gate must have ndim >= 2 (..., M, K)");
+  }
+  int N = w.shape(-2);
+  auto out_shape = gate.shape();
+  out_shape.back() = N;
+
+  std::vector<array> inputs = {gate, up, w, scales};
+  if (biases.has_value()) {
+    inputs.push_back(*biases);
+  }
+  inputs.push_back(rhs_indices);
+
+  return array(
+      std::move(out_shape),
+      gate.dtype(),
+      std::make_shared<FusedSwiGLUGatherQMV>(
+          s, /* fallback */ nullptr, group_size, bits, mode),
+      std::move(inputs));
 }
 
 } // namespace mlx::core::fast

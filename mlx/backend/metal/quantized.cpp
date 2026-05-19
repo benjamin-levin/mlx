@@ -1023,6 +1023,72 @@ void gather_qmv(
   compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
 }
 
+void gather_qmv_swiglu(
+    const array& gate,
+    const array& up,
+    const array& w,
+    const array& scales,
+    const std::optional<array>& biases,
+    const array& lhs_indices,
+    const array& rhs_indices,
+    array& out,
+    int group_size,
+    int bits,
+    int M,
+    int N,
+    int K,
+    metal::Device& d,
+    const Stream& s,
+    const std::string& mode) {
+  int B = out.size() / M / N;
+
+  int bn = 8;
+  int bk = 32;
+  MTL::Size group_dims(bk, 2, 1);
+  MTL::Size grid_dims(M, (N + bn - 1) / bn, B);
+
+  // Fused SiLU(gate)*up + gather_qmv. Only the "fast" template path is
+  // implemented (requires N % 8 == 0 && K % 512 == 0, true for Qwen3.6).
+  std::string kname;
+  kname.reserve(64);
+  std::string type_string = get_type_string(gate.dtype());
+  concatenate(
+      kname,
+      mode + "_gather_qmv_swiglu_",
+      type_string,
+      "_gs_",
+      group_size,
+      "_b_",
+      bits);
+
+  auto kernel = get_quantized_kernel_wrapped(
+      d, kname, "gather_qmv_swiglu", mode, type_string, group_size, bits);
+
+  auto& compute_encoder = metal::get_command_encoder(s);
+  compute_encoder.set_compute_pipeline_state(kernel);
+
+  int c = 0;
+  compute_encoder.set_input_array(w, c++);
+  compute_encoder.set_input_array(scales, c++);
+  if (biases) {
+    compute_encoder.set_input_array(*biases, c++);
+  }
+  compute_encoder.set_input_array(gate, c++);
+  compute_encoder.set_input_array(up, c++);
+  compute_encoder.set_input_array(lhs_indices, c++);
+  compute_encoder.set_input_array(rhs_indices, c++);
+  compute_encoder.set_output_array(out, c++);
+  compute_encoder.set_bytes(K, c++);
+  compute_encoder.set_bytes(N, c++);
+  // gate and up share strides/shapes — pass gate's; the kernel offsets
+  // both by the same delta inside.
+  c = add_strides_and_shapes(
+      compute_encoder, false, gate, w, scales, biases, c);
+  add_gather_strides_and_shapes(compute_encoder, lhs_indices, rhs_indices, c);
+
+  compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+}
+
 void gather_qvm(
     const array& x,
     const array& w,
@@ -1746,6 +1812,56 @@ void fast::ConvertFP8::eval_gpu(
   auto& in = inputs[0];
   auto& out = outputs[0];
   unary_op_gpu(inputs, out, name(), stream());
+}
+
+void fast::FusedSwiGLUGatherQMV::eval_gpu(
+    const std::vector<array>& inputs,
+    std::vector<array>& outputs) {
+  // Inputs: [gate, up, w, scales, (biases?), rhs_indices]
+  // The lhs_indices is implicit — we use rhs_indices for both, since
+  // each k_slot maps gate[k]/up[k] to expert rhs_indices[k].
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+  auto& out = outputs[0];
+  out.set_data(allocator::malloc(out.nbytes()));
+
+  bool has_biases = (inputs.size() == 6);
+  array gate = ensure_row_contiguous_matrix(inputs[0], d, s);
+  array up = ensure_row_contiguous_matrix(inputs[1], d, s);
+  array w = ensure_row_contiguous_matrix(inputs[2], d, s);
+  array scales = ensure_row_contiguous_matrix(inputs[3], d, s);
+  std::optional<array> biases = std::nullopt;
+  if (has_biases) {
+    biases = ensure_row_contiguous_matrix(inputs[4], d, s);
+  }
+  const array& rhs_indices = inputs[inputs.size() - 1];
+  // Use rhs_indices as lhs_indices too — they parallel-index gate/up.
+  const array& lhs_indices = rhs_indices;
+
+  // Each gather slot is a single matvec: M=1 inner row, K=in_vec_size,
+  // N=out_vec_size. The "batch" dim B = number of gather slots.
+  int K = gate.shape(-1);
+  int M = 1;
+  int N = out.shape(-1);
+  auto mode = mode_;
+
+  gather_qmv_swiglu(
+      gate,
+      up,
+      w,
+      scales,
+      biases,
+      lhs_indices,
+      rhs_indices,
+      out,
+      group_size_,
+      bits_,
+      M,
+      N,
+      K,
+      d,
+      s,
+      mode);
 }
 
 } // namespace mlx::core
