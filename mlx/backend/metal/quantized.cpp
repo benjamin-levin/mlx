@@ -1748,4 +1748,210 @@ void fast::ConvertFP8::eval_gpu(
   unary_op_gpu(inputs, out, name(), stream());
 }
 
+// =========================================================================
+// FusedQSDPA: 2-pass quantized SDPA with GQA-shared K/V loads.
+// =========================================================================
+
+namespace {
+
+inline int pick_qsdpa_blocks(int T_kv, int gqa_factor, int T_q) {
+  // The multi-row tile variant processes TILE_KPOS=GQA_FACTOR kpos per outer
+  // iter, so a single threadgroup makes faster progress than the strict
+  // 1-kpos-per-iter MLX baseline. We need ~256 TGs in flight on M4 Max for
+  // good occupancy; beyond that the per-TG outer-iter count gets too small.
+  int blocks;
+  if (T_kv >= 65536) {
+    blocks = 512;
+  } else if (T_kv >= 16384) {
+    blocks = 256;
+  } else if (T_kv >= 4096) {
+    blocks = 128;
+  } else {
+    blocks = 64;
+  }
+  if (blocks < 32) {
+    blocks = 32;
+  }
+  return (blocks / 32) * 32;
+}
+
+void gather_qsdpa_2pass(
+    const array& queries,
+    const array& k_packed,
+    const array& k_scales,
+    const array& k_biases,
+    const array& v_packed,
+    const array& v_scales,
+    const array& v_biases,
+    const array* left_padding, // may be nullptr
+    array& out,
+    float scale,
+    int group_size,
+    int bits,
+    int head_dim,
+    int gqa_factor,
+    bool do_causal,
+    bool has_left_padding,
+    metal::Device& d,
+    const Stream& s) {
+  const int B = queries.shape(0);
+  const int H = queries.shape(1);
+  const int T_q = queries.shape(2);
+  const int D = head_dim;
+
+  const int KV_H = k_packed.shape(1);
+  const int T_kv = k_packed.shape(2);
+
+  const int blocks = pick_qsdpa_blocks(T_kv, gqa_factor, T_q);
+
+  // Allocate intermediates.
+  Shape partial_o_shape = {B * H, T_q, blocks, D};
+  Shape partial_ms_shape = {B * H, T_q, blocks};
+  array partial_o(std::move(partial_o_shape), queries.dtype(), nullptr, {});
+  array partial_m(partial_ms_shape, float32, nullptr, {});
+  array partial_s(std::move(partial_ms_shape), float32, nullptr, {});
+  partial_o.set_data(allocator::malloc(partial_o.nbytes()));
+  partial_m.set_data(allocator::malloc(partial_m.nbytes()));
+  partial_s.set_data(allocator::malloc(partial_s.nbytes()));
+
+  auto& compute_encoder = metal::get_command_encoder(s);
+  compute_encoder.add_temporary(partial_o);
+  compute_encoder.add_temporary(partial_m);
+  compute_encoder.add_temporary(partial_s);
+
+  std::string type_string = get_type_string(queries.dtype());
+
+  // ---------- Pass 1 ----------
+  {
+    std::string kname;
+    kname.reserve(96);
+    concatenate(
+        kname,
+        "fused_qsdpa_pass1_",
+        type_string,
+        "_d_",
+        D,
+        "_gs_",
+        group_size,
+        "_b_",
+        bits,
+        "_gqa_",
+        gqa_factor);
+    bool do_causal_fc = do_causal;
+    bool has_lp_fc = has_left_padding;
+    metal::MTLFCList func_consts = {
+        {&do_causal_fc, MTL::DataType::DataTypeBool, 30},
+        {&has_lp_fc, MTL::DataType::DataTypeBool, 31},
+    };
+    std::string hash_name = kname;
+    hash_name += do_causal_fc ? "_c" : "_nc";
+    hash_name += has_lp_fc ? "_lp" : "_nlp";
+
+    auto kernel = d.get_kernel(kname, hash_name, func_consts);
+
+    compute_encoder.set_compute_pipeline_state(kernel);
+
+    int c = 0;
+    compute_encoder.set_input_array(queries, c++);
+    compute_encoder.set_input_array(k_packed, c++);
+    compute_encoder.set_input_array(k_scales, c++);
+    compute_encoder.set_input_array(k_biases, c++);
+    compute_encoder.set_input_array(v_packed, c++);
+    compute_encoder.set_input_array(v_scales, c++);
+    compute_encoder.set_input_array(v_biases, c++);
+    compute_encoder.set_output_array(partial_o, c++);
+    compute_encoder.set_output_array(partial_m, c++);
+    compute_encoder.set_output_array(partial_s, c++);
+    compute_encoder.set_bytes(T_kv, c++);
+    compute_encoder.set_bytes(KV_H, c++);
+    compute_encoder.set_bytes(blocks, c++);
+    compute_encoder.set_bytes(scale, c++);
+    // Buffer 14: left_padding (always bound for binding-index stability;
+    // the kernel only reads it when has_lp_fc == true). When unused, we
+    // bind a single-element zero array so the binding is valid.
+    if (has_left_padding && left_padding != nullptr) {
+      compute_encoder.set_input_array(*left_padding, c++);
+    } else {
+      // Bind queries again as a placeholder — buffer index 14 still gets
+      // a valid resource, but the kernel never reads it.
+      compute_encoder.set_input_array(queries, c++);
+    }
+
+    MTL::Size group_dims(32, gqa_factor, T_q);
+    MTL::Size grid_dims(KV_H * 32, B * gqa_factor, blocks * T_q);
+    compute_encoder.dispatch_threads(grid_dims, group_dims);
+  }
+
+  // ---------- Pass 2 ----------
+  {
+    std::string kname;
+    kname.reserve(96);
+    concatenate(kname, "fused_qsdpa_pass2_", type_string, "_d_", D);
+
+    auto kernel = d.get_kernel(kname);
+    compute_encoder.set_compute_pipeline_state(kernel);
+
+    int c = 0;
+    compute_encoder.set_input_array(partial_o, c++);
+    compute_encoder.set_input_array(partial_m, c++);
+    compute_encoder.set_input_array(partial_s, c++);
+    compute_encoder.set_output_array(out, c++);
+    compute_encoder.set_bytes(blocks, c++);
+
+    MTL::Size group_dims(1024, 1, 1);
+    MTL::Size grid_dims(B * H * 1024, T_q, 1);
+    compute_encoder.dispatch_threads(grid_dims, group_dims);
+  }
+}
+
+} // namespace
+
+void fast::FusedQSDPA::eval_gpu(
+    const std::vector<array>& inputs,
+    std::vector<array>& outputs) {
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+  auto& out = outputs[0];
+  out.set_data(allocator::malloc(out.nbytes()));
+
+  array queries = ensure_row_contiguous_matrix(inputs[0], d, s);
+  array k_packed = ensure_row_contiguous_matrix(inputs[1], d, s);
+  array k_scales = ensure_row_contiguous_matrix(inputs[2], d, s);
+  array k_biases = ensure_row_contiguous_matrix(inputs[3], d, s);
+  array v_packed = ensure_row_contiguous_matrix(inputs[4], d, s);
+  array v_scales = ensure_row_contiguous_matrix(inputs[5], d, s);
+  array v_biases = ensure_row_contiguous_matrix(inputs[6], d, s);
+
+  // Inputs after the seven Q/K/V buffers:
+  //   - if has_mask_:           inputs[7] = mask array
+  //   - if has_left_padding_:   inputs[7 + (has_mask_ ? 1 : 0)] = left_padding
+  array lp_arr({0}, int32);
+  array* lp_ptr = nullptr;
+  if (has_left_padding_) {
+    int lp_idx = 7 + (has_mask_ ? 1 : 0);
+    lp_arr = ensure_row_contiguous_matrix(inputs[lp_idx], d, s);
+    lp_ptr = &lp_arr;
+  }
+
+  gather_qsdpa_2pass(
+      queries,
+      k_packed,
+      k_scales,
+      k_biases,
+      v_packed,
+      v_scales,
+      v_biases,
+      lp_ptr,
+      out,
+      scale_,
+      group_size_,
+      bits_,
+      head_dim_,
+      gqa_factor_,
+      do_causal_,
+      has_left_padding_,
+      d,
+      s);
+}
+
 } // namespace mlx::core

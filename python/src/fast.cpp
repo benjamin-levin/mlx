@@ -624,4 +624,80 @@ void init_fast(nb::module_& parent_module) {
            before the kernel runs. Default: ``False``.
         stream (mx.stream, optional): Stream to run the kernel on. Default: ``None``.
       )pbdoc");
+
+  m.def(
+      "fused_qsdpa",
+      [](const mx::array& queries,
+         const mx::array& q_keys_packed,
+         const mx::array& q_keys_scales,
+         const mx::array& q_keys_biases,
+         const mx::array& q_values_packed,
+         const mx::array& q_values_scales,
+         const mx::array& q_values_biases,
+         float scale,
+         const std::optional<mx::array>& mask,
+         int group_size,
+         int bits,
+         int head_dim,
+         int gqa_factor,
+         bool do_causal,
+         const std::optional<mx::array>& left_padding,
+         const std::string& mode,
+         mx::StreamOrDevice s) {
+        return mx::fast::fused_qsdpa(
+            queries,
+            q_keys_packed,
+            q_keys_scales,
+            q_keys_biases,
+            q_values_packed,
+            q_values_scales,
+            q_values_biases,
+            scale,
+            mask,
+            group_size,
+            bits,
+            head_dim,
+            gqa_factor,
+            do_causal,
+            left_padding,
+            mode,
+            s);
+      },
+      "queries"_a,
+      "q_keys_packed"_a,
+      "q_keys_scales"_a,
+      "q_keys_biases"_a,
+      "q_values_packed"_a,
+      "q_values_scales"_a,
+      "q_values_biases"_a,
+      "scale"_a,
+      "mask"_a = nb::none(),
+      nb::kw_only(),
+      "group_size"_a = 64,
+      "bits"_a = 4,
+      "head_dim"_a = 256,
+      "gqa_factor"_a = 8,
+      "do_causal"_a = false,
+      "left_padding"_a = nb::none(),
+      "mode"_a = "affine",
+      "stream"_a = nb::none(),
+      nb::sig(
+          "def fused_qsdpa(queries: array, q_keys_packed: array, q_keys_scales: array, q_keys_biases: array, q_values_packed: array, q_values_scales: array, q_values_biases: array, scale: float, mask: Optional[array] = None, *, group_size: int = 64, bits: int = 4, head_dim: int = 256, gqa_factor: int = 8, do_causal: bool = False, left_padding: Optional[array] = None, mode: str = 'affine', stream: Union[None, Stream, Device] = None) -> array"),
+      R"pbdoc(
+        Fused quantized 2-pass SDPA with GQA-shared K/V loads.
+
+        Performs decode-time scaled-dot-product attention against an
+        already quantized KV cache without ever materializing dequantized
+        K/V tensors. K and V tiles are cooperatively loaded into
+        threadgroup memory and shared across the ``gqa_factor`` query
+        heads in each kv head's group.
+
+        Currently supported: ``T_q == 1`` (decode), ``head_dim == 256``,
+        ``bits in {4, 8}``, ``group_size in {32, 64}``, ``gqa_factor == 8``,
+        causal mask only. Out-of-distribution shapes raise ValueError; the
+        caller is expected to fall back to a Python-side reference path.
+
+        Returns:
+          array: shape (B, n_q_heads, T_q, head_dim).
+      )pbdoc");
 }

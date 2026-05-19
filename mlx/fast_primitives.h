@@ -424,4 +424,79 @@ class CustomKernel : public Primitive {
   int shared_memory_;
 };
 
+// Fused quantized 2-pass SDPA with GQA-shared K/V loads.
+// Inputs:
+//   queries:       (B, n_q_heads, T_q=1, D)  -- bf16/fp16/float
+//   q_keys_packed: (B, n_kv_heads, T_kv, D / EL_PER_INT)  -- uint32
+//   q_keys_scales: (B, n_kv_heads, T_kv, D / GROUP_SIZE)  -- same dtype as
+//   queries q_keys_biases: (B, n_kv_heads, T_kv, D / GROUP_SIZE)  -- same dtype
+//   as queries q_values_packed/scales/biases: same shape pattern as keys
+// Output:
+//   out:           (B, n_q_heads, T_q, D)
+//
+// Currently supports T_q=1 decode, head_dim=256, bits in {4,8},
+// group_size in {32,64}, gqa_factor=8, causal mask only. With
+// has_left_padding=true the kernel additionally masks the leading per-batch
+// padding positions provided via the optional `left_padding` input array
+// (int32[B]).
+class FusedQSDPA : public Custom {
+ public:
+  FusedQSDPA(
+      Stream stream,
+      std::function<std::vector<array>(std::vector<array>)> fallback,
+      float scale,
+      int group_size,
+      int bits,
+      int head_dim,
+      int gqa_factor,
+      bool has_mask,
+      bool do_causal,
+      bool has_left_padding,
+      const std::string& mode)
+      : Custom(stream, std::move(fallback)),
+        scale_(scale),
+        group_size_(group_size),
+        bits_(bits),
+        head_dim_(head_dim),
+        gqa_factor_(gqa_factor),
+        has_mask_(has_mask),
+        do_causal_(do_causal),
+        has_left_padding_(has_left_padding),
+        mode_(mode) {}
+
+  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override {
+    throw std::runtime_error("FusedQSDPA: CPU not implemented");
+  }
+  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+
+  DEFINE_NAME(FusedQSDPA)
+  bool is_equivalent(const Primitive& other) const override;
+
+  auto state() const {
+    return std::make_tuple(
+        scale_,
+        group_size_,
+        bits_,
+        head_dim_,
+        gqa_factor_,
+        has_mask_,
+        do_causal_,
+        has_left_padding_,
+        mode_);
+  }
+
+ private:
+  float scale_;
+  int group_size_;
+  int bits_;
+  int head_dim_;
+  int gqa_factor_;
+  bool has_mask_;
+  bool do_causal_;
+  bool has_left_padding_;
+  std::string mode_;
+};
+
 } // namespace mlx::core::fast

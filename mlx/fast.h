@@ -100,4 +100,40 @@ MLX_API std::vector<array> precompiled_cuda_kernel(
     bool ensure_row_contiguous = false,
     StreamOrDevice s = {});
 
+/**
+ * Fused quantized 2-pass SDPA with GQA-shared K/V loads.
+ *
+ * Decode-time scaled-dot-product attention against an already quantized KV
+ * cache. Equivalent to:
+ *
+ *   K = dequantize(q_keys_packed, q_keys_scales, q_keys_biases, group_size,
+ * bits) V = dequantize(q_values_packed, q_values_scales, q_values_biases,
+ * group_size, bits) out = softmax(Q @ K^T * scale + mask) @ V
+ *
+ * but executed as a single fused 2-pass kernel that (a) avoids materializing
+ * dequantized K/V tensors and (b) cooperatively loads each K/V tile into
+ * threadgroup memory once for all gqa_factor query heads.
+ *
+ * Currently supported: T_q=1 (decode), head_dim=256, bits in {4,8},
+ * group_size in {32,64}, gqa_factor=8, causal-only mask.
+ */
+MLX_API array fused_qsdpa(
+    const array& queries,
+    const array& q_keys_packed,
+    const array& q_keys_scales,
+    const array& q_keys_biases,
+    const array& q_values_packed,
+    const array& q_values_scales,
+    const array& q_values_biases,
+    float scale,
+    const std::optional<array>& mask = std::nullopt,
+    int group_size = 64,
+    int bits = 4,
+    int head_dim = 256,
+    int gqa_factor = 8,
+    bool do_causal = false,
+    const std::optional<array>& left_padding = std::nullopt,
+    const std::string& mode = "affine",
+    StreamOrDevice s = {});
+
 } // namespace mlx::core::fast

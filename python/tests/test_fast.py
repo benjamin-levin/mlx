@@ -1011,6 +1011,313 @@ class TestFast(mlx_tests.MLXTestCase):
         out = call_kernel(a, source)
         self.assertTrue(mx.array_equal(out, mx.ones_like(out)))
 
+    # ------------------------------------------------------------------
+    # fused_qsdpa: 2-pass attention on quantized KV cache (decode shape).
+    # Currently supported: T_q == 1, head_dim == 256, gqa_factor == 8,
+    # bits in {4, 8}, group_size in {32, 64}.
+    # ------------------------------------------------------------------
+
+    def _fused_qsdpa_build_inputs(
+        self,
+        B,
+        T_kv,
+        bits,
+        group_size,
+        head_dim=256,
+        gqa_factor=8,
+        n_kv_heads=1,
+        dtype=mx.bfloat16,
+        seed=0,
+    ):
+        """Build (queries, packed K/V tuple, dequantized K/V) for tests."""
+        mx.random.seed(seed)
+        n_q_heads = n_kv_heads * gqa_factor
+        q = mx.random.normal(shape=(B, n_q_heads, 1, head_dim)).astype(dtype)
+        k = mx.random.normal(shape=(B, n_kv_heads, T_kv, head_dim)).astype(dtype)
+        v = mx.random.normal(shape=(B, n_kv_heads, T_kv, head_dim)).astype(dtype)
+        k_packed, k_scales, k_biases = mx.quantize(k, group_size=group_size, bits=bits)
+        v_packed, v_scales, v_biases = mx.quantize(v, group_size=group_size, bits=bits)
+        k_deq = mx.dequantize(k_packed, k_scales, k_biases, group_size, bits)
+        v_deq = mx.dequantize(v_packed, v_scales, v_biases, group_size, bits)
+        return (
+            q,
+            (k_packed, k_scales, k_biases, v_packed, v_scales, v_biases),
+            (k_deq, v_deq),
+        )
+
+    @staticmethod
+    def _fused_qsdpa_cosine(a, b):
+        a = a.astype(mx.float32).flatten()
+        b = b.astype(mx.float32).flatten()
+        num = mx.sum(a * b)
+        den = mx.sqrt(mx.sum(a * a) * mx.sum(b * b))
+        return (num / mx.maximum(den, mx.array(1e-30))).item()
+
+    @unittest.skipIf(not mx.metal.is_available(), "Metal is not available")
+    def test_fused_qsdpa_correctness(self):
+        head_dim = 256
+        gqa_factor = 8
+        B = 1
+        scale = 1.0 / math.sqrt(head_dim)
+
+        for T_kv in (4096, 16384):
+            for bits in (4, 8):
+                for group_size in (32, 64):
+                    with self.subTest(T_kv=T_kv, bits=bits, group_size=group_size):
+                        q, packed, (k_deq, v_deq) = self._fused_qsdpa_build_inputs(
+                            B=B,
+                            T_kv=T_kv,
+                            bits=bits,
+                            group_size=group_size,
+                            head_dim=head_dim,
+                            gqa_factor=gqa_factor,
+                        )
+                        ref = mx.fast.scaled_dot_product_attention(
+                            q, k_deq, v_deq, scale=scale, mask="causal"
+                        )
+                        out = mx.fast.fused_qsdpa(
+                            q,
+                            *packed,
+                            scale=scale,
+                            group_size=group_size,
+                            bits=bits,
+                            head_dim=head_dim,
+                            gqa_factor=gqa_factor,
+                            do_causal=True,
+                        )
+                        mx.eval(ref, out)
+                        self.assertEqual(out.shape, ref.shape)
+                        self.assertEqual(out.dtype, ref.dtype)
+                        cos = self._fused_qsdpa_cosine(out, ref)
+                        self.assertGreaterEqual(cos, 0.9999)
+
+    @unittest.skipIf(not mx.metal.is_available(), "Metal is not available")
+    def test_fused_qsdpa_left_padding(self):
+        head_dim = 256
+        gqa_factor = 8
+        B = 3
+        bits = 4
+        group_size = 64
+        scale = 1.0 / math.sqrt(head_dim)
+
+        for T_kv in (4096, 16384):
+            lp_configs = {
+                "none": None,
+                "zeros": mx.zeros((B,), dtype=mx.int32),
+                "varied": mx.array([0, T_kv // 4, T_kv // 2], dtype=mx.int32),
+            }
+            for name, lp in lp_configs.items():
+                with self.subTest(T_kv=T_kv, left_padding=name):
+                    q, packed, (k_deq, v_deq) = self._fused_qsdpa_build_inputs(
+                        B=B,
+                        T_kv=T_kv,
+                        bits=bits,
+                        group_size=group_size,
+                        head_dim=head_dim,
+                        gqa_factor=gqa_factor,
+                    )
+                    # Reference: SDPA on dequantized K/V with a boolean
+                    # mask that encodes the per-batch leading pad. For
+                    # T_q == 1, causal collapses to "all positions valid",
+                    # so the per-batch left-pad mask is the only mask term.
+                    k_idx = mx.arange(T_kv)
+                    if lp is None:
+                        valid = mx.ones((B, T_kv), dtype=mx.bool_)
+                    else:
+                        valid = k_idx[None, :] >= lp[:, None]
+                    mask = valid[:, None, None, :]
+                    ref = mx.fast.scaled_dot_product_attention(
+                        q, k_deq, v_deq, scale=scale, mask=mask
+                    )
+                    out = mx.fast.fused_qsdpa(
+                        q,
+                        *packed,
+                        scale=scale,
+                        group_size=group_size,
+                        bits=bits,
+                        head_dim=head_dim,
+                        gqa_factor=gqa_factor,
+                        do_causal=True,
+                        left_padding=lp,
+                    )
+                    mx.eval(ref, out)
+                    cos = self._fused_qsdpa_cosine(out, ref)
+                    self.assertGreaterEqual(cos, 0.999985)
+
+    @unittest.skipIf(not mx.metal.is_available(), "Metal is not available")
+    def test_fused_qsdpa_extreme_left_padding(self):
+        # Regression for the online-softmax NaN edge case: when the first
+        # kpos tile lands entirely inside the padded prefix for some batch
+        # row, both max_score and new_max are -INFINITY and the pre-fix
+        # update produced exp(NaN) = NaN.
+        head_dim = 256
+        gqa_factor = 8
+        B = 2
+        bits = 4
+        group_size = 64
+        T_kv = 4096
+        scale = 1.0 / math.sqrt(head_dim)
+
+        q, packed, (k_deq, v_deq) = self._fused_qsdpa_build_inputs(
+            B=B,
+            T_kv=T_kv,
+            bits=bits,
+            group_size=group_size,
+            head_dim=head_dim,
+            gqa_factor=gqa_factor,
+        )
+        # Batch 0: unpadded. Batch 1: only the very last K position is
+        # valid, so the kernel must handle a strided prefix tile that is
+        # entirely masked.
+        lp = mx.array([0, T_kv - 1], dtype=mx.int32)
+        k_idx = mx.arange(T_kv)
+        valid = k_idx[None, :] >= lp[:, None]
+        mask = valid[:, None, None, :]
+        ref = mx.fast.scaled_dot_product_attention(
+            q, k_deq, v_deq, scale=scale, mask=mask
+        )
+        out = mx.fast.fused_qsdpa(
+            q,
+            *packed,
+            scale=scale,
+            group_size=group_size,
+            bits=bits,
+            head_dim=head_dim,
+            gqa_factor=gqa_factor,
+            do_causal=True,
+            left_padding=lp,
+        )
+        mx.eval(ref, out)
+        self.assertFalse(mx.any(mx.isnan(out)).item())
+        cos = self._fused_qsdpa_cosine(out, ref)
+        self.assertGreaterEqual(cos, 0.999985)
+
+    @unittest.skipIf(not mx.metal.is_available(), "Metal is not available")
+    def test_fused_qsdpa_input_validation(self):
+        head_dim = 256
+        gqa_factor = 8
+        B = 1
+        bits = 4
+        group_size = 64
+        T_kv = 1024
+        scale = 1.0 / math.sqrt(head_dim)
+
+        q, packed, _ = self._fused_qsdpa_build_inputs(
+            B=B,
+            T_kv=T_kv,
+            bits=bits,
+            group_size=group_size,
+            head_dim=head_dim,
+            gqa_factor=gqa_factor,
+        )
+
+        def call(**overrides):
+            kwargs = dict(
+                scale=scale,
+                group_size=group_size,
+                bits=bits,
+                head_dim=head_dim,
+                gqa_factor=gqa_factor,
+                do_causal=True,
+            )
+            kwargs.update(overrides)
+            out = mx.fast.fused_qsdpa(q, *packed, **kwargs)
+            mx.eval(out)
+            return out
+
+        # bits must be 4 or 8.
+        with self.assertRaises(ValueError):
+            call(bits=2)
+        with self.assertRaises(ValueError):
+            call(bits=16)
+
+        # group_size must be 32 or 64.
+        with self.assertRaises(ValueError):
+            call(group_size=128)
+
+        # head_dim and gqa_factor are constrained in this build.
+        with self.assertRaises(ValueError):
+            call(head_dim=128)
+        with self.assertRaises(ValueError):
+            call(gqa_factor=4)
+
+        # mode must be 'affine'.
+        with self.assertRaises(ValueError):
+            call(mode="mxfp4")
+
+        # T_q != 1 is unsupported (decode only).
+        q_multi = mx.random.normal(shape=(B, gqa_factor, 2, head_dim)).astype(
+            mx.bfloat16
+        )
+        with self.assertRaises(ValueError):
+            out = mx.fast.fused_qsdpa(
+                q_multi,
+                *packed,
+                scale=scale,
+                group_size=group_size,
+                bits=bits,
+                head_dim=head_dim,
+                gqa_factor=gqa_factor,
+                do_causal=True,
+            )
+            mx.eval(out)
+
+        # queries last dim must match head_dim.
+        q_wrong_d = mx.random.normal(shape=(B, gqa_factor, 1, 128)).astype(mx.bfloat16)
+        with self.assertRaises(ValueError):
+            out = mx.fast.fused_qsdpa(
+                q_wrong_d,
+                *packed,
+                scale=scale,
+                group_size=group_size,
+                bits=bits,
+                head_dim=head_dim,
+                gqa_factor=gqa_factor,
+                do_causal=True,
+            )
+            mx.eval(out)
+
+        # left_padding must be int32, 1-D, length B.
+        with self.assertRaises(ValueError):
+            out = mx.fast.fused_qsdpa(
+                q,
+                *packed,
+                scale=scale,
+                group_size=group_size,
+                bits=bits,
+                head_dim=head_dim,
+                gqa_factor=gqa_factor,
+                do_causal=True,
+                left_padding=mx.zeros((B,), dtype=mx.float32),
+            )
+            mx.eval(out)
+        with self.assertRaises(ValueError):
+            out = mx.fast.fused_qsdpa(
+                q,
+                *packed,
+                scale=scale,
+                group_size=group_size,
+                bits=bits,
+                head_dim=head_dim,
+                gqa_factor=gqa_factor,
+                do_causal=True,
+                left_padding=mx.zeros((B + 1,), dtype=mx.int32),
+            )
+            mx.eval(out)
+        with self.assertRaises(ValueError):
+            out = mx.fast.fused_qsdpa(
+                q,
+                *packed,
+                scale=scale,
+                group_size=group_size,
+                bits=bits,
+                head_dim=head_dim,
+                gqa_factor=gqa_factor,
+                do_causal=True,
+                left_padding=mx.zeros((B, 2), dtype=mx.int32),
+            )
+            mx.eval(out)
+
 
 if __name__ == "__main__":
     mlx_tests.MLXTestRunner()
